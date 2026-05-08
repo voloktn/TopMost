@@ -46,6 +46,7 @@ from .models.crosslingual.InfoCTM.InfoCTM import InfoCTM
 
 from .models.dynamic.DETM import DETM
 from .models.dynamic.CFDTM.CFDTM import CFDTM
+from .models.dynamic.CFSDTM.CFSDTM import CFSDTM
 
 from .models.hierarchical.SawETM.SawETM import SawETM
 from .models.hierarchical.HyperMiner.HyperMiner import HyperMiner
