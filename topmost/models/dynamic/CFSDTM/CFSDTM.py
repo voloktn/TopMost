@@ -137,6 +137,10 @@ class CFSDTM(nn.Module):
 
     # ── Gate interface ───────────────────────────────────────────────────────
 
+    def get_beta(self) -> torch.Tensor:
+        """Topic-word distributions (T, K, V). Works without a forward pass."""
+        return self.base.get_beta()
+
     def get_gates(self) -> torch.Tensor:
         """Returns gate matrix (T, K). Call .detach().cpu() before plotting."""
         return self.gate()
