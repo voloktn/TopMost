@@ -260,7 +260,7 @@ class CFSDTMTrainer:
                 rise_threshold = self.birth_rise_threshold,
                 min_target     = self.birth_min_target,
             )
-            self._utilization = (utilization.numpy()
+            self._utilization = (utilization.cpu().numpy()
                                  if hasattr(utilization, 'numpy') else utilization)
             self._P  = None
             self._dP = None
