@@ -11,6 +11,7 @@ Workflow called by CFSDTMTrainer after the warmup phase:
   3. apply_birth_prior    — prevent gates closing for freshly-born topics
 """
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -126,7 +127,9 @@ def compute_utilization(model, dataloader, num_times, num_topics, device='cpu'):
     return utilization
 
 
-def utilization_to_target(utilization, temp=2.0, cov_threshold=0.25,
+def utilization_to_target(utilization, temp=2.0,
+                           cov_threshold=None,
+                           cov_k_std=0.0,
                            stable_target=0.85):
     """
     Convert raw utilization matrix to gate targets via z-normalisation with
@@ -148,6 +151,7 @@ def utilization_to_target(utilization, temp=2.0, cov_threshold=0.25,
 
     Step 2 — CoV detector for stable (ever-present) topics:
       CoV = U_std / U_mean                      # (K,)
+      If cov_threshold is None: threshold = CoV.mean() + cov_k_std * CoV.std()
       Stable topics have low temporal variation → z-score ≈ 0 everywhere
       → sigmoid(0) = 0.5 → supervision is uninformative.
       Fix: force target = stable_target for all slices of stable topics.
@@ -155,27 +159,36 @@ def utilization_to_target(utilization, temp=2.0, cov_threshold=0.25,
     Parameters
     ----------
     utilization   : torch.Tensor (T, K) — output of compute_utilization
-    temp          : float — temperature scaling for sigmoid       (default 2.0)
-    cov_threshold : float — CoV below this → topic is stable     (default 0.25)
-    stable_target : float — gate target for stable topics        (default 0.85)
+    temp          : float — temperature scaling for sigmoid              (default 2.0)
+    cov_threshold : float or None — fixed CoV threshold; None = dynamic  (default None)
+    cov_k_std     : float — dynamic threshold shift in std units         (default 0.0)
+    stable_target : float — gate target for stable topics               (default 0.85)
 
     Returns
     -------
-    target      : torch.Tensor (T, K) gate targets ∈ (0, 1)
-    CoV         : torch.Tensor (K,) coefficient of variation per topic
-    stable_mask : torch.BoolTensor (K,) True = stable (ever-present) topic
+    target             : torch.Tensor (T, K) gate targets ∈ (0, 1)
+    CoV                : torch.Tensor (K,) coefficient of variation per topic
+    stable_mask        : torch.BoolTensor (K,) True = stable (ever-present) topic
+    cov_threshold_used : float — the threshold actually applied
     """
     U_mean = utilization.mean(dim=0, keepdim=True)                    # (1, K)
     U_std  = utilization.std(dim=0, keepdim=True).clamp(min=1e-6)     # (1, K)
     U_z    = (utilization - U_mean) / U_std                            # (T, K)
     target = torch.sigmoid(U_z * temp)                                 # (T, K)
 
-    CoV         = (U_std / U_mean.clamp(min=1e-6)).squeeze(0)         # (K,)
-    stable_mask = CoV < cov_threshold                                  # (K,)
+    CoV = (U_std / U_mean.clamp(min=1e-6)).squeeze(0)                 # (K,)
 
+    if cov_threshold is None:
+        cov_mean = CoV.mean().item()
+        cov_std  = CoV.std().item()
+        cov_threshold_used = cov_mean + cov_k_std * cov_std
+    else:
+        cov_threshold_used = float(cov_threshold)
+
+    stable_mask = CoV < cov_threshold_used                             # (K,)
     target[:, stable_mask] = stable_target
 
-    return target, CoV, stable_mask
+    return target, CoV, stable_mask, cov_threshold_used
 
 
 def apply_birth_prior(target, rise_threshold=0.25, min_target=0.65):
@@ -232,3 +245,120 @@ def apply_birth_prior(target, rise_threshold=0.25, min_target=0.65):
                 )
 
     return target, report
+
+
+def compute_penetration_target(
+    model,
+    dataloader,
+    num_times,
+    num_topics,
+    device='cpu',
+    theta_min=0.10,
+    alpha=1.0,
+    beta_deriv=2.0,
+    temp=2.0,
+    cov_threshold=None,
+    cov_k_std=0.0,
+    stable_target=0.85,
+):
+    """
+    Compute gate targets from penetration rate and its first derivative.
+
+    P[t,k] = fraction of documents in slice t where theta[d,k] > theta_min.
+    dP[t,k] = P[t,k] - P[t-1,k]  (first difference; dP[0] = 0).
+
+    Captures topic birth dynamics that mean-theta utilization misses: a rising
+    topic can have low absolute theta mass but a strong dP signal.
+
+    Parameters
+    ----------
+    model          : CFSDTM instance
+    dataloader     : DataLoader yielding dicts with 'bow'/'times' or tuple
+    num_times      : number of time slices T
+    num_topics     : number of topics K
+    device         : target device string
+    theta_min      : float — threshold for "document belongs to topic" (default 0.10)
+    alpha          : float — weight for absolute penetration level     (default 1.0)
+    beta_deriv     : float — weight for penetration derivative         (default 2.0)
+    temp           : float — sigmoid temperature for z-score conversion (default 2.0)
+    cov_threshold  : float or None — fixed CoV threshold; None = dynamic (default None)
+    cov_k_std      : float — dynamic threshold shift in std units      (default 0.0)
+    stable_target  : float — gate target for stable topics             (default 0.85)
+
+    Returns
+    -------
+    target             : torch.Tensor (T, K) gate targets ∈ (0, 1)
+    CoV                : torch.Tensor (K,) coefficient of variation per topic
+    stable_mask        : torch.BoolTensor (K,) True = stable topic
+    cov_threshold_used : float — CoV threshold actually applied
+    P                  : np.ndarray (T, K) penetration rate per slice
+    dP                 : np.ndarray (T, K) first difference of penetration rate
+    """
+    # Step 1 — collect theta per slice
+    model.train()
+    theta_by_slice = {t: [] for t in range(num_times)}
+
+    with torch.no_grad():
+        for batch in dataloader:
+            if isinstance(batch, dict):
+                bow = batch.get('bow')
+                if bow is None: bow = batch.get('x')
+                if bow is None: bow = batch.get('data')
+                times = batch.get('times')
+                if times is None: times = batch.get('time_id')
+                if times is None: times = batch.get('time_ids')
+                if times is None: times = batch.get('t')
+            elif isinstance(batch, (list, tuple)):
+                bow   = batch[0]
+                times = batch[1] if len(batch) > 1 else None
+            else:
+                raise ValueError(f'Неизвестный формат батча: {type(batch)}')
+
+            bow      = bow.float().to(device)
+            times    = times.long().to(device)
+            theta    = extract_theta(model, bow, device).cpu().numpy()  # (B, K)
+            times_np = times.cpu().numpy()
+
+            for t in range(num_times):
+                mask = times_np == t
+                if mask.any():
+                    theta_by_slice[t].append(theta[mask])
+
+    # Step 2 — penetration rate P[t, k]
+    P = np.zeros((num_times, num_topics), dtype=np.float32)
+    for t in range(num_times):
+        if theta_by_slice[t]:
+            theta_t = np.vstack(theta_by_slice[t])       # (N_t, K)
+            P[t] = (theta_t > theta_min).mean(axis=0)
+
+    # Step 3 — first derivative dP
+    dP = np.zeros_like(P)
+    dP[1:] = P[1:] - P[:-1]
+
+    # Step 4 — z-normalise per topic and apply sigmoid
+    def _znorm_sigmoid(x, t):
+        mean = x.mean(axis=0, keepdims=True)
+        std  = x.std(axis=0, keepdims=True).clip(1e-6)
+        z    = (x - mean) / std
+        return torch.sigmoid(torch.tensor(z * t, dtype=torch.float32))
+
+    P_score  = _znorm_sigmoid(P,  temp)   # (T, K)
+    dP_score = _znorm_sigmoid(dP, temp)   # (T, K)
+
+    # Step 5 — combine in logit space
+    P_logit  = torch.logit(P_score.clamp(0.05, 0.95))
+    dP_logit = torch.logit(dP_score.clamp(0.05, 0.95))
+    target   = torch.sigmoid(alpha * P_logit + beta_deriv * dP_logit)
+
+    # Step 6 — CoV-based stable topic override (uses mean-theta utilization)
+    util = compute_utilization(model, dataloader, num_times, num_topics, device)
+    _, CoV, stable_mask, cov_threshold_used = utilization_to_target(
+        util,
+        temp=temp,
+        cov_threshold=cov_threshold,
+        cov_k_std=cov_k_std,
+        stable_target=stable_target,
+    )
+    target[:, stable_mask] = stable_target
+
+    return target, CoV, stable_mask, cov_threshold_used, P, dP

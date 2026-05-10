@@ -34,6 +34,7 @@ from tqdm import tqdm
 from .gate_supervision import (
     extract_theta,
     compute_utilization,
+    compute_penetration_target,
     utilization_to_target,
     apply_birth_prior,
 )
@@ -63,7 +64,12 @@ class CFSDTMTrainer:
     lambda_smooth        : weight for temporal smoothness loss       (default 0.05)
     lambda_sup           : weight for supervision MSE loss           (default 8.0)
     gate_temp            : temperature for z-normalisation sigmoid   (default 2.0)
-    cov_threshold        : CoV below this → topic is stable          (default 0.25)
+    gate_init_mode       : 'utilization' (mean theta) or 'penetration' (P + dP) (default 'utilization')
+    theta_min            : penetration threshold theta[d,k] > theta_min (default 0.10)
+    penetration_alpha    : weight for absolute penetration level P    (default 1.0)
+    penetration_beta     : weight for penetration derivative dP       (default 2.0)
+    cov_threshold        : CoV below this → topic is stable; None = dynamic (default None)
+    cov_k_std            : dynamic threshold = mean + k*std of CoV    (default 0.0)
     stable_target        : gate target for stable (ever-present) topics (default 0.85)
     birth_rise_threshold : Δhalf threshold for birth detection       (default 0.25)
     birth_min_target     : minimum gate target after birth point     (default 0.65)
@@ -87,7 +93,12 @@ class CFSDTMTrainer:
         lambda_smooth:        float = 0.05,
         lambda_sup:           float = 8.0,
         gate_temp:            float = 2.0,
-        cov_threshold:        float = 0.25,
+        gate_init_mode:       str   = 'utilization',
+        theta_min:            float = 0.10,
+        penetration_alpha:    float = 1.0,
+        penetration_beta:     float = 2.0,
+        cov_threshold:        Optional[float] = None,
+        cov_k_std:            float = 0.0,
         stable_target:        float = 0.85,
         birth_rise_threshold: float = 0.25,
         birth_min_target:     float = 0.65,
@@ -115,17 +126,25 @@ class CFSDTMTrainer:
         self.lambda_smooth        = lambda_smooth
         self.lambda_sup           = lambda_sup
         self.gate_temp            = gate_temp
+        self.gate_init_mode       = gate_init_mode
+        self.theta_min            = theta_min
+        self.penetration_alpha    = penetration_alpha
+        self.penetration_beta     = penetration_beta
         self.cov_threshold        = cov_threshold
+        self.cov_k_std            = cov_k_std
         self.stable_target        = stable_target
         self.birth_rise_threshold = birth_rise_threshold
         self.birth_min_target     = birth_min_target
         self.warmup_sparse        = warmup_sparse
 
-        self._U_fixed      = None   # supervision target fixed after warmup
-        self._utilization  = None   # raw utilization tensor from warmup
-        self._cov          = None   # CoV per topic
-        self._stable_mask  = None   # bool mask of stable topics
-        self._birth_report = []
+        self._U_fixed            = None
+        self._utilization        = None
+        self._P                  = None
+        self._dP                 = None
+        self._cov                = None
+        self._stable_mask        = None
+        self._birth_report       = []
+        self._cov_threshold_used = None
 
         self.history: dict = {
             'loss'         : [],   # ELBO per epoch (warmup + finetune)
@@ -217,34 +236,67 @@ class CFSDTMTrainer:
     # ── Gate initialisation ──────────────────────────────────────────────────
 
     def _init_gates(self) -> None:
-        """Compute utilization from warmup model; initialise gate logits."""
+        """Compute gate supervision targets from warmup model; initialise gate logits."""
         model = self.model
 
-        print('[CF-SDTM] Computing topic utilization from warmup model…')
-        utilization = compute_utilization(
-            model,
-            self.dataset.train_dataloader,
-            self.dataset.num_times,
-            model.num_topics,
-            self.device,
-        )
-        self._utilization = utilization
+        if self.gate_init_mode == 'utilization':
+            print('[CF-SDTM] Computing topic utilization from warmup model…')
+            utilization = compute_utilization(
+                model,
+                self.dataset.train_dataloader,
+                self.dataset.num_times,
+                model.num_topics,
+                self.device,
+            )
+            target, CoV, stable_mask, cov_threshold_used = utilization_to_target(
+                utilization,
+                temp          = self.gate_temp,
+                cov_threshold = self.cov_threshold,
+                cov_k_std     = self.cov_k_std,
+                stable_target = self.stable_target,
+            )
+            target, birth_report = apply_birth_prior(
+                target,
+                rise_threshold = self.birth_rise_threshold,
+                min_target     = self.birth_min_target,
+            )
+            self._utilization = (utilization.numpy()
+                                 if hasattr(utilization, 'numpy') else utilization)
+            self._P  = None
+            self._dP = None
 
-        target, CoV, stable_mask = utilization_to_target(
-            utilization,
-            temp          = self.gate_temp,
-            cov_threshold = self.cov_threshold,
-            stable_target = self.stable_target,
-        )
-        self._cov         = CoV
-        self._stable_mask = stable_mask
+        elif self.gate_init_mode == 'penetration':
+            print('[CF-SDTM] Computing penetration-rate targets from warmup model…')
+            target, CoV, stable_mask, cov_threshold_used, P, dP = \
+                compute_penetration_target(
+                    model,
+                    self.dataset.train_dataloader,
+                    self.dataset.num_times,
+                    model.num_topics,
+                    device        = self.device,
+                    theta_min     = self.theta_min,
+                    alpha         = self.penetration_alpha,
+                    beta_deriv    = self.penetration_beta,
+                    temp          = self.gate_temp,
+                    cov_threshold = self.cov_threshold,
+                    cov_k_std     = self.cov_k_std,
+                    stable_target = self.stable_target,
+                )
+            birth_report = ['penetration mode: birth_prior skipped']
+            self._utilization = None
+            self._P  = P
+            self._dP = dP
 
-        target, birth_report = apply_birth_prior(
-            target,
-            rise_threshold = self.birth_rise_threshold,
-            min_target     = self.birth_min_target,
-        )
-        self._birth_report = birth_report
+        else:
+            raise ValueError(
+                f"gate_init_mode должен быть 'utilization' или 'penetration', "
+                f"получено: '{self.gate_init_mode}'"
+            )
+
+        self._cov                = CoV
+        self._stable_mask        = stable_mask
+        self._cov_threshold_used = cov_threshold_used
+        self._birth_report       = birth_report
 
         stable_indices = stable_mask.nonzero(as_tuple=False).squeeze(-1).tolist()
         if isinstance(stable_indices, int):
@@ -254,10 +306,11 @@ class CFSDTMTrainer:
         self.history['stable_topics'] = stable_indices
         self.history['birth_report']  = birth_report
 
-        if stable_indices:
-            print(f'  Stable topics (CoV < {self.cov_threshold}): {stable_indices}')
+        print(f'[CF-SDTM] gate_init_mode={self.gate_init_mode}')
+        print(f'[CF-SDTM] cov_threshold_used={cov_threshold_used:.4f}, '
+              f'stable_topics={stable_mask.sum().item()}')
         for line in birth_report:
-            print(f'  Birth prior: {line}')
+            print(f'[CF-SDTM] {line}')
 
         model.gate.logits.requires_grad_(True)
         with torch.no_grad():
@@ -266,9 +319,8 @@ class CFSDTMTrainer:
                 tgt_clipped / (1.0 - tgt_clipped)
             ).to(self.device)
 
-        # Supervision target is fixed — not updated during fine-tune
         self._U_fixed = target.clone().to(self.device)
-        print('[CF-SDTM] Gate logits initialised from utilization targets.')
+        print('[CF-SDTM] Gate logits initialised.')
 
     # ── Phase 2: Fine-tune ───────────────────────────────────────────────────
 
@@ -417,15 +469,19 @@ class CFSDTMTrainer:
         with torch.no_grad():
             gates = torch.sigmoid(model.gate.logits).cpu().numpy()
 
-        cov  = self._cov.cpu().numpy()         if self._cov         is not None else None
-        util = self._utilization.cpu().numpy() if self._utilization is not None else None
+        cov = self._cov.cpu().numpy() if self._cov is not None else None
 
         return {
-            'gates'        : gates,
-            'active_mask'  : gates > gate_threshold,
-            'cov'          : cov,
-            'stable_topics': self.history.get('stable_topics', []),
-            'utilization'  : util,
+            'gates'             : gates,
+            'active_mask'       : gates > gate_threshold,
+            'cov'               : cov,
+            'stable_topics'     : self.history.get('stable_topics', []),
+            'gate_init_mode'    : self.gate_init_mode,
+            'cov_threshold_used': (float(self._cov_threshold_used)
+                                   if self._cov_threshold_used is not None else None),
+            'utilization'       : self._utilization,
+            'penetration_P'     : self._P,
+            'penetration_dP'    : self._dP,
         }
 
     def get_train_theta(self) -> np.ndarray:
