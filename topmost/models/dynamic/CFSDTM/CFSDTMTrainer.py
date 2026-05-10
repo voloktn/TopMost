@@ -29,6 +29,7 @@ import torch.nn.functional as F
 import numpy as np
 from torch.nn.utils import clip_grad_norm_
 from typing import Optional
+from tqdm import tqdm
 
 from .gate_supervision import (
     extract_theta,
@@ -178,7 +179,7 @@ class CFSDTMTrainer:
 
         print(f'[CF-SDTM] Warmup: {self.warmup_epochs} epochs, gates frozen at g≈1.')
 
-        for epoch in range(1, self.warmup_epochs + 1):
+        for epoch in tqdm(range(1, self.warmup_epochs + 1), desc='Warmup', unit='ep'):
             model.train()
             epoch_loss = 0.0
             n_batches  = 0
@@ -208,7 +209,7 @@ class CFSDTMTrainer:
             self.history['loss'].append(avg_loss)
 
             if epoch % self.log_every == 0:
-                print(
+                tqdm.write(
                     f'  Warmup  {epoch:4d}/{self.warmup_epochs}  '
                     f'elbo {avg_loss:9.2f}'
                 )
@@ -288,7 +289,8 @@ class CFSDTMTrainer:
             f'lambda_sup={self.lambda_sup}  warmup_sparse={self.warmup_sparse}'
         )
 
-        for epoch in range(1, self.finetune_epochs + 1):
+        pbar = tqdm(range(1, self.finetune_epochs + 1), desc='Fine-tune', unit='ep')
+        for epoch in pbar:
             model.train()
             epoch_elbo  = 0.0
             epoch_gloss = 0.0
@@ -355,7 +357,8 @@ class CFSDTMTrainer:
             scheduler.step()
 
             if epoch % self.log_every == 0:
-                print(
+                pbar.set_postfix(elbo=f'{avg_elbo:.1f}', active=f'{active:.0%}')
+                tqdm.write(
                     f'  Fine-tune {epoch:4d}/{self.finetune_epochs}  '
                     f'elbo {avg_elbo:9.2f}  '
                     f'gate_loss {avg_gloss:.4f}  '
