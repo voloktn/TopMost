@@ -98,9 +98,13 @@ def compute_utilization(model, dataloader, num_times, num_topics, device='cpu'):
     with torch.no_grad():
         for batch in dataloader:
             if isinstance(batch, dict):
-                bow   = batch.get('bow') or batch.get('x') or batch.get('data')
-                times = (batch.get('times') or batch.get('time_id')
-                         or batch.get('time_ids') or batch.get('t'))
+                bow = batch.get('bow')
+                if bow is None: bow = batch.get('x')
+                if bow is None: bow = batch.get('data')
+                times = batch.get('times')
+                if times is None: times = batch.get('time_id')
+                if times is None: times = batch.get('time_ids')
+                if times is None: times = batch.get('t')
             elif isinstance(batch, (list, tuple)):
                 bow   = batch[0]
                 times = batch[1] if len(batch) > 1 else None
